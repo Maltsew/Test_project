@@ -1,27 +1,15 @@
 # -*- coding: utf-8 -*-
 
-"""
-загрузка данных с удаленного сервера с помощью библиотеки paramiko
-допущения: на сервере - Linux. в storage папки с файлами расположены
-в иерархии сначала год 21/ -> 02/ -> 25/, внутри которых уже и находятся 
-искомые файлы. нет ограничения на время скачивания, нет ограничения
-на время архивирования, и нет ограничения на объем локального диска.
-в упрощенном виде я просто выгружу весь сервер на лок. машину, 
-заархивирую каждую папку, потом каждый архив
-отправлю на архивный сервер. можно скачивать только например по 1 году
-с хранилища, архивировать такой каталог и после его отправлять,
-можно поработать с потоками.
-"""
-
 
 import paramiko
 import os
 from stat import S_ISDIR as isdir
 import zipfile
-from pathlib import Path
 import fnmatch
 import logging
 import logging.config
+import datetime
+import pysftp
 
 
 def download_from_remote(sftp_obj, remote_dir_name, local_dir_name):
@@ -38,17 +26,13 @@ def download_from_remote(sftp_obj, remote_dir_name, local_dir_name):
             sub_local = sub_local.replace('\\', '/')
             download_from_remote(sftp_obj, sub_remote, sub_local)
     else:
-        """исходная папка not isdir - конечный каталог, 
-        день месяца. загружаем файлы, путь на локальном такой же как до
-        исходной папки на сервере"""
-        
         #print ('загрузка файла: '+ remote_dir_name)
         sftp.get(remote_dir_name, local_dir_name)
         logger = logging.getLogger("exampleApp")
         logger.info('download file with name' + f'{remote_dir_name}')
         
 
-def check_local_dir(local_dir_name):
+def check_local_dir(local_dir_name): 
     #проверка локальной папки, если нет - создаем
     if not os.path.exists(local_dir_name):
         os.makedirs(local_dir_name)
@@ -63,10 +47,36 @@ def create_archive(local_dir_name):
     zf.close()
     
 def process_logging():
+    """ логирование операций """
     logging.config.fileConfig('logging.conf')
+    
+def search_older_file(sftp_obj, remote_dir_name):
+    """ функция для определения наличия на сервере storage файлов старше 
+    90 дней """
+    today = datetime.date.today()
+    remote_file = sftp_obj.stat(remote_dir_name)
+    if isdir(remote_file):
+        for remote_file_name in sftp.listdir(remote_dir_name):
+            sub_remote = os.path.join(remote_dir_name, remote_file_name)
+            sub_remote = sub_remote.replace('\\', '-')
+            search_older_file(sftp_obj, sub_remote)
+    else:
+        remote_dir_name = remote_dir_name.split('-')
+        remote_files_date = datetime.date(int(remote_dir_name[0]),
+                                    int(remote_dir_name[1]),
+                                    int(remote_dir_name[2]))
+        
+        global oldest_files
+        oldest_files = today - remote_files_date
+    return oldest_files
+    
+def storage_dir_name(dirname):
+    """ массив хранит названия всех папок с сервера """
+    dir_names = []
+    dir_names.append(dirname)     
         
 if __name__ == "__main__":
-    
+    """"""
     process_logging()
     logger = logging.getLogger("exampleApp")
     logger.info('Starting program')
@@ -77,63 +87,36 @@ if __name__ == "__main__":
     storage_password = 'PASS'
     storage_port = 22
     
-    
-    """Резберемся теперь со storage. Загрузку данных с него необходимо выполнить
-    только если диск занят на > 90% (примем что диск один) или если данные
-    хранятся на нем больше 90 дней. Можем получить эту информацию по ssh
-    сервера, и тут снова использую paramiko, т.к. с его помощью можно выполнить
-    запрос напрямую"""
-    
-    
     client = paramiko.SSHClient()
     client.connect(storage_name, storage_port, 
                    storage_user_name, storage_password)
     stdin, stdout, stderr = client.exec_command('df -h')
-    
-    
-    """в stdout получим колонки Filesystem, Size, Used, Avail, Use%, Mounted on
-    получим только значение USE%, потом отбросим %, приведем к int и сравним
-    со значением 90. Превысили - начинаем выгрузку со storage. На сервере может
-    быть несколько систем, много дисков, как вариант в stdout считывать [4] для
-    всех строк, потом посчитать среднюю заполненность сервера, думаю"""
-    
-    
-    current_volume = stdout.sys.agrv[4]
-    procent = '%'
-    current_volume = current_volume - procent
+
+    out = stdout.read().decode().strip()
+    current_volume = out.sys.agrv[4]
     current_volume = int(current_volume)
+    logger = logging.getLogger("exampleApp")
+    logger.info(f'{current_volume} of storage server is load')
     
     
-    """ Для второго условия выгрузки могу только предположить. также через
-    SSHClient заходить на сервер. сделать функцию, которая будет проходить по
-    всем папкам,которые являются дерикториями, и записывать названия в 
-    формат вроде гггг-мм-дд. собрать все названия в список, сортировать. 
-    от сегодняшней даты отсчитывать 90 дней, вычислить эту дату. после попытаться
-    найти эту дату в списке, и если она есть, взять срез от начала до это даты,
-    это и будут папки с датами старше 90 дней. Скорее всего, все можно сделать
-    намного проще в линуксе, надо подумать
-    """
-    
-    
-    if current_volume > 90:
+    if (current_volume > 90) or (oldest_files > 90):
         #путь к каталогу на локальной машине
         local_dir = 'archive/'
-        
-        
-        """Путь к удаленному серверу. Требуется абсолютный путь к файлам, поскольку 
-        папок много, нужно будет менять абсолютный путь для каждой даты
-        решение - использовать pathlib, списковым включением верну все подкаталоги
-        """
-        
-        
-        p = Path('storage/')
-        storage_remote_dir = [folder for folder in p.iterdir() if folder.is_dir()]
-        #подключение к storage
+        #путь ко всем каталогам на сервере storage
+        #используем pysftp для рекурсивного возврата всех каталогов
+        cnopts = pysftp.CnOpts()
+        with pysftp.Connection(host=storage_name, username=storage_user_name, 
+                                 private_key=storage_password, 
+                                 cnopts=cnopts) as sftp:
+            sftp.walktree(storage_name, storage_dir_name,recurse=True)
+        #подключение к storage просмотра каталогов на наличие старых файлов
+        search_older_file(sftp, storage_dir_name)
+        #подключение к storage для загрузки
         t = paramiko.Transport((storage_name, storage_port))
         t.connect(username=storage_user_name, password=storage_password)
         sftp = paramiko.SFTPClient.from_transport(t)
         #вызываем загрузчик
-        download_from_remote(sftp, storage_remote_dir, local_dir)
+        download_from_remote(sftp, storage_dir_name, local_dir)
         #Close connection
         t.close()
         logger = logging.getLogger("exampleApp")
@@ -147,11 +130,6 @@ if __name__ == "__main__":
         arhive_user_name = 'USER'
         arhive_password = 'PASS'
         arhive_port = 25
-        
-        
-        """путь к архиву.на локальной машине надо перебирать из списка всех архивов
-        отпрвляем только архивы, чтобы не скинуть лог"""
-        
         
         #Путь к архивному серверу
         archive_remote_dir = 'archive/'
@@ -169,6 +147,4 @@ if __name__ == "__main__":
                 logger = logging.getLogger("exampleApp")
                 logger.info(f'{filename} send to' + f'{archive_remote_dir}')
             
-    
-    
-    
+
